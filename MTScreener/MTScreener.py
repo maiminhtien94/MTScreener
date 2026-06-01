@@ -145,22 +145,22 @@ def plot_crypto_chart(symbol_name, limit_bars=100):
         )
         
         # Map axes to specific charts
-        ax_h1_candle = axes[0, 0]
-        ax_h1_vol    = axes[1, 0]
-        ax_h4_candle = axes[0, 1]
-        ax_h4_vol    = axes[1, 1]
+        ax_h4_candle = axes[0, 0]
+        ax_h4_vol    = axes[1, 0]
+        ax_h1_candle = axes[0, 1]
+        ax_h1_vol    = axes[1, 1]
 
         # 6. Configure EMA indicators and link them to their respective candle axes
         indicators_h1 = [
             mpf.make_addplot(plot_h1['ema34'], color='#ff9800', width=1.2, ax=ax_h1_candle),
-            mpf.make_addplot(plot_h1['ema89'], color='#4caf50', width=1.2, ax=ax_h1_candle)
+            mpf.make_addplot(plot_h1['ema89'], color='#4caf50', width=2.4, ax=ax_h1_candle)
         ]
         indicators_h4 = [
             mpf.make_addplot(plot_h4['ema34'], color='#ff9800', width=1.2, ax=ax_h4_candle),
-            mpf.make_addplot(plot_h4['ema89'], color='#4caf50', width=1.2, ax=ax_h4_candle)
+            mpf.make_addplot(plot_h4['ema89'], color='#4caf50', width=2.4, ax=ax_h4_candle)
         ]
 
-        # 7. Plot H1 Chart (Left column)
+        # 7. Plot H1 Chart (Right column)
         mpf.plot(
             plot_h1, type='candle', ax=ax_h1_candle, volume=ax_h1_vol, 
             addplot=indicators_h1, style=custom_style
@@ -169,7 +169,7 @@ def plot_crypto_chart(symbol_name, limit_bars=100):
         ax_h1_candle.set_ylabel('Price (USDT)', color='white')
         ax_h1_vol.set_ylabel('Volume', color='white')
 
-        # 8. Plot H4 Chart (Right column)
+        # 8. Plot H4 Chart (Left column)
         mpf.plot(
             plot_h4, type='candle', ax=ax_h4_candle, volume=ax_h4_vol, 
             addplot=indicators_h4, style=custom_style
@@ -177,8 +177,41 @@ def plot_crypto_chart(symbol_name, limit_bars=100):
         ax_h4_candle.set_title(f"{symbol} - 4H TIMEFRAME", color='white', fontsize=12, fontweight='bold')
         ax_h4_candle.set_ylabel('Price (USDT)', color='white')
         ax_h4_vol.set_ylabel('Volume', color='white')
+        # 9. TRIỆT TIÊU LỖI CHỮ TỐI - ÉP MÀU TRỰC TIẾP CHO TỪNG TRỤC
+        text_color = '#b2b5be'  # Màu xám sáng chuẩn TradingView
+        border_color = '#2a2e39' # Màu viền hộp chart
 
-        # 9. Format figure appearance
+        for ax in axes.flatten():
+            # Đổi màu toàn bộ số trên trục X và trục Y thành màu sáng
+            ax.tick_params(axis='both', which='both', colors=text_color, labelsize=7)
+            
+            # Ép chữ hiển thị của các nhãn trục (Price, Volume nếu có)
+            ax.yaxis.label.set_color(text_color)
+            ax.xaxis.label.set_color(text_color)
+            
+            # Đổi màu đường viền bao quanh các ô đồ thị
+            for spine in ax.spines.values():
+                spine.set_edgecolor(border_color)
+        # KÍCH HOẠT HIỂN THỊ TRỤC THỜI GIAN CHO BIỂU ĐỒ NẾN (PHÍA TRÊN)
+        # Ép các trục của nến (hàng 0) phải hiển thị lại nhãn thời gian vốn bị sharex giấu đi
+        ax_h4_candle.tick_params(labelbottom=True)
+        ax_h1_candle.tick_params(labelbottom=True)
+        
+        # Xoay nhẹ góc chữ ngày/giờ ở biểu đồ nến để tránh bị dính chữ vào nhau
+        plt.setp(ax_h4_candle.get_xticklabels(), rotation=30, horizontalalignment='right')
+        plt.setp(ax_h1_candle.get_xticklabels(), rotation=30, horizontalalignment='right')
+
+        # Định vị lại vị trí nhãn giá sang bên phải cho dễ nhìn (giống TradingView)
+        ax_h4_candle.yaxis.tick_right()
+        ax_h4_vol.yaxis.tick_right()
+        ax_h1_candle.yaxis.tick_right()
+        ax_h1_vol.yaxis.tick_right()
+
+        # Đẩy nhãn tên trục sang bên phải cho khớp vị trí cột giá vừa chuyển
+        ax_h4_candle.yaxis.set_label_position("right")
+        ax_h1_candle.yaxis.set_label_position("right")
+
+        # 10. Format figure appearance
         fig.suptitle(f"Multi-Timeframe Analysis: {symbol}", color='white', fontsize=16, fontweight='bold', y=0.98)
         fig.patch.set_facecolor('#131722') # Set window outer background color
         
@@ -287,6 +320,6 @@ def scan_market():
 
 if __name__ == "__main__":
     scan_market()
-    #plot_crypto_chart("ETHUSDT",limit_bars=80)
+    #plot_crypto_chart("YFIUSDT",limit_bars=200)
 
 
