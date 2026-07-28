@@ -1,3 +1,5 @@
+import os
+import ctypes
 import ccxt
 import pandas as pd
 import mplfinance as mpf
@@ -28,6 +30,12 @@ time_cache = {}           # Bộ nhớ đệm lưu DatetimeIndex gốc của t�
 bm_background = None      # KỸ THUẬT BLITTING: Ảnh chụp bộ nhớ đệm đồ thị nền cố định
 is_updating = False       # KHÓA LUỒNG: Chống xung đột dữ liệu ngầm
 
+favorite_signals = []      # Danh sách lưu các mã coin ông thích
+current_view_mode = "ALL"  # "ALL": Xem danh sách quét | "FAV": Xem danh sách yêu thích
+backup_all_signals = []    # Biến tạm để cất danh sách quét gốc khi đổi chế độ view
+index_all = 0  # Lưu vị trí đang xem của danh sách Quét gốc
+index_fav = 0  # Lưu vị trí đang xem của danh sách Yêu thích
+
 # --- BIẾN TOÀN CỤC CHO CÔNG CỤ THƯỚC ĐO % ---
 ruler_start = None        # Lưu tọa độ điểm click đầu tiên (x, y)
 ruler_elements = {}       # Lưu trữ các đối tượng vẽ thước đo (hộp màu và text) trên các trục
@@ -44,6 +52,9 @@ def get_active_trading_symbols():
         tickers = exchange.fetch_tickers()
         active_symbols = []
         
+        # Mốc Volume tối thiểu (20 triệu USDT)
+        MIN_VOLUME_USDT = 2_000_000
+
         for symbol, ticker_info in tickers.items():
             # 1. 🎯 BỘ LỌC TÊN COIN: Loại bỏ chữ Trung Quốc / Ký tự lạ ngay từ đầu
             # Trích xuất phần tên coin thô trước dấu gạch chéo (Ví dụ: 'BTC/USDT:USDT' -> 'BTC')
@@ -61,16 +72,42 @@ def get_active_trading_symbols():
                 # 3. Kiểm tra trạng thái hoạt động và thanh khoản của sàn
                 raw_info = ticker_info.get('info', {})
                 status = raw_info.get('status', '').upper()
-                v24h = ticker_info.get('baseVolume', 0)
                 current_price = ticker_info.get('last', 0)
                 
-                if (status == 'TRADING' or current_price > 0) and v24h > 0:
+                # 🎯 BƯỚC MỚI: Lấy Volume 24h tính theo USDT (quoteVolume)
+                # Trong CCXT, 'quoteVolume' là khối lượng tính bằng USDT. 
+                # Nếu CCXT trả về None, ta lấy (baseVolume * current_price) để chữa cháy.
+                quote_volume = ticker_info.get('quoteVolume')
+                if quote_volume is None:
+                    base_volume = ticker_info.get('baseVolume', 0) or 0
+                    quote_volume = base_volume * current_price
+
+                if (status == 'TRADING' or current_price > 0) and quote_volume >= MIN_VOLUME_USDT:
                     active_symbols.append(symbol)
+                    # 🎯 Chuyển đổi sang đơn vị Triệu đô (Millions)
+                    vol_in_millions = quote_volume / 1_000_000
+                    # Trích xuất tên ngắn gọn (VD: 'SOL/USDT:USDT' -> 'SOLUSDT')
+                    clean_name = symbol.split(':')[0].replace('/', '')
+                    # In ra console dạng gọt bớt phần trăm nghìn, chỉ giữ lại số Triệu (.1f hoặc .2f)
+                    print(f"  [ACCEPTED] {clean_name:<10} | Vol 24h: {vol_in_millions:.1f}M USDT")
                     
         return active_symbols
     except Exception as e:
         print(f"Error fetching active trading symbols: {e}")
         return []
+
+def get_ticker_24h_volume(symbol):
+    """ Hàm phụ trợ lấy nhanh Volume 24h (USDT) của 1 coin cụ thể """
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        quote_vol = ticker.get('quoteVolume')
+        if quote_vol is None:
+            base_vol = ticker.get('baseVolume', 0) or 0
+            last_price = ticker.get('last', 0) or 0
+            quote_vol = base_vol * last_price
+        return quote_vol or 0
+    except Exception:
+        return 0
 
 def get_data(symbol, timeframe):
     try:
@@ -124,6 +161,15 @@ def on_mouse_press(event):
     global ruler_start, is_updating
     if is_updating or event.button != 1 or not event.inaxes:
         return
+        
+    # 🎯 THỦ THUẬT QUAN TRỌNG: Vô hiệu hóa tính năng Zoom-to-rect mặc định của Matplotlib
+    # Khi nhấn chuột trái, nếu thanh công cụ đang bật chế độ Zoom/Pan, ta tạm ngắt nó để không phá tỷ lệ đồ thị
+    try:
+        if event.canvas.figure.canvas.manager.toolbar.mode != '':
+            event.canvas.figure.canvas.manager.toolbar.mode = ''
+    except Exception:
+        pass
+        
     ruler_start = (event.xdata, event.ydata)
 
 def on_mouse_release(event):
@@ -132,9 +178,13 @@ def on_mouse_release(event):
         return
     ruler_start = None
     fig = event.canvas.figure
+    
+    # Ẩn toàn bộ thước đo khi buông chuột
     for ax, elements in ruler_elements.items():
         elements['rect'].set_visible(False)
         elements['text'].set_visible(False)
+        
+    # Khôi phục lại màn hình sạch sẽ không tì vết
     if bm_background and fig:
         fig.canvas.restore_region(bm_background)
         fig.canvas.blit(fig.bbox)
@@ -150,6 +200,7 @@ def on_mouse_move(event):
     cross_color = '#5d606b'
     fig = event.canvas.figure
     
+    # Khởi tạo crosshairs nếu chưa có
     if current_ax not in crosshairs:
         crosshairs[current_ax] = {
             'v_line': current_ax.axvline(x_target, color=cross_color, linestyle='--', linewidth=0.8),
@@ -159,6 +210,7 @@ def on_mouse_move(event):
                                     visible=False)
         }
         
+    # Khởi tạo thước đo nếu chưa có
     if current_ax not in ruler_elements:
         ruler_elements[current_ax] = {
             'rect': plt.Rectangle((0, 0), 0, 0, facecolor='#26a69a', alpha=0.2, visible=False),
@@ -168,16 +220,17 @@ def on_mouse_move(event):
         }
         current_ax.add_patch(ruler_elements[current_ax]['rect'])
 
-    # Blitting khôi phục nền cũ từ RAM
+    # 1. Khôi phục lại nền đồ họa gốc từ bộ nhớ RAM (Xóa sạch các vết vẽ cũ của frame trước)
     fig.canvas.restore_region(bm_background)
     
+    # 2. Cập nhật tọa độ tâm chữ thập (Crosshair) cho khung đang tương tác
     lines = crosshairs[current_ax]
     lines['v_line'].set_xdata([x_target, x_target])
     lines['h_line'].set_ydata([y_target, y_target])
     lines['v_line'].set_visible(True)
     lines['h_line'].set_visible(True)
     
-    # Thuật toán kéo thước đo %
+    # 3. Logic xử lý tính toán khoảng cách & % của thước đo
     r_elem = ruler_elements[current_ax]
     if ruler_start is not None:
         x_start, y_start = ruler_start
@@ -188,6 +241,7 @@ def on_mouse_move(event):
         r_elem['rect'].set_width(width)
         r_elem['rect'].set_height(height)
         
+        # Đổi màu xanh/đỏ động theo xu hướng kéo lên hay kéo xuống
         if height >= 0:
             r_elem['rect'].set_facecolor('#26a69a') 
             r_elem['text'].get_bbox_patch().set_edgecolor('#26a69a')
@@ -205,23 +259,24 @@ def on_mouse_move(event):
         r_elem['rect'].set_visible(False)
         r_elem['text'].set_visible(False)
 
-    # Đọc thời gian chuẩn xác từ DatetimeIndex gốc
+    # 4. Hiển thị nhãn giá/thời gian tại tâm chuột
     try:
         idx = int(round(x_target))
         ax_datetime_index = time_cache[current_ax]
         if 0 <= idx < len(ax_datetime_index):
             time_str = ax_datetime_index[idx].strftime('%b %d, %H:%M')
             if ruler_start is not None:
-                lines['text'].set_visible(False) 
+                lines['text'].set_visible(False) # Ẩn text tọa độ thường để ưu tiên hiển thị text của thước đo
             else:
                 lines['text'].set_text(f" P: {y_target:.4f} \n T: {time_str} ")
                 lines['text'].set_position((x_target, y_target))
                 lines['text'].set_visible(True)
-        else: lines['text'].set_visible(False)
+        else:
+            lines['text'].set_visible(False)
     except Exception:
         lines['text'].set_visible(False)
 
-    # Ẩn các trục không tương tác
+    # 5. Ép ẩn hoàn toàn các thành phần của các trục không tương tác
     for ax, ax_lines in crosshairs.items():
         if ax != current_ax:
             ax_lines['v_line'].set_visible(False)
@@ -232,7 +287,7 @@ def on_mouse_move(event):
             r_el['rect'].set_visible(False)
             r_el['text'].set_visible(False)
 
-    # Đẩy pixel đồ họa động lên màn hình
+    # 6. THỰC THI BLIT (Vẽ đè mượt): Chỉ vẽ những thằng được set_visible(True)
     for ax, ax_lines in crosshairs.items():
         if ax_lines['v_line'].get_visible():
             ax.draw_artist(ax_lines['v_line'])
@@ -246,11 +301,12 @@ def on_mouse_move(event):
         if r_el['text'].get_visible() and r_el['text'].figure is not None:
             ax.draw_artist(r_el['text'])
                 
+    # Đẩy trực tiếp bộ đệm pixel lên màn hình nền
     fig.canvas.blit(fig.bbox)
 
 def render_charts(fig, axes, symbol, limit_bars, custom_style):
     global current_tf_mode, is_updating, bm_background, crosshairs, time_cache, ruler_start, list_signals, current_index
-    
+    global favorite_signals, current_view_mode  # Thêm 2 biến này để quản lý danh sách yêu thích
     # Khóa luồng an toàn khi người dùng đang đo thước
     if ruler_start is not None:
         return
@@ -271,7 +327,10 @@ def render_charts(fig, axes, symbol, limit_bars, custom_style):
     
     df_left = get_data(ccxt_symbol, tf_left)
     df_right = get_data(ccxt_symbol, tf_right)
-    
+
+    # 🎯 Lấy chỉ số Volume 24h thực tế
+    vol_24h_usdt = get_ticker_24h_volume(ccxt_symbol)
+
     if df_left.empty or df_right.empty:
         print(f"[ERROR] Failed to fetch data for {symbol}")
         fig.suptitle(f"⚠️ {symbol} - Tải dữ liệu thất bại!", color='red', fontsize=14, fontweight='bold', y=0.98)
@@ -342,6 +401,30 @@ def render_charts(fig, axes, symbol, limit_bars, custom_style):
     time_cache[ax_right_candle] = plot_right.index
     time_cache[ax_right_vol]    = plot_right.index
 
+    # 🎯 KIỂM TRA VÀ TẠO TEXT HIỂN THỊ CHẾ ĐỘ DANH SÁCH (ALL / FAVORITE)
+    if 'current_view_mode' in globals() and current_view_mode == "FAV":
+        mode_text = f"MODE: *FAVORITE* ({current_index + 1}/{len(list_signals)})"
+    else:
+        # Nếu nhập mã tay ngoài danh sách thì info_idx xử lý bên dưới, mặc định chế độ là ALL
+        mode_text = f"MODE: SCAN LIST ({current_index + 1}/{len(list_signals)})" if list_signals and symbol in list_signals else "MODE: MANUAL SEARCH"
+    
+    # Nếu mã hiện tại đang nằm trong danh sách Favorite, đóng thêm dấu mộc [⭐ FAVED]
+    if 'favorite_signals' in globals() and symbol in favorite_signals:
+        mode_text += " [* FAVED]"
+
+    # Vẽ khung nhãn hiển thị chế độ ở góc trên bên trái của Chart bên trái (khung lớn)
+    # Tọa độ (0.02, 0.93) là tỷ lệ tương đối trên trục giúp nhãn luôn cố định không bị đè bởi nến giá
+    ax_left_candle.text(0.02, 0.93, mode_text, transform=ax_left_candle.transAxes, 
+                        color='#ff9800', fontsize=8.5, fontweight='bold',
+                        bbox=dict(facecolor='#1c2030', edgecolor='#ff9800', alpha=0.85, boxstyle='round,pad=0.3'))
+
+    # 🔥 HIỂN THỊ BADGE VOLUME 24H NGAY GÓC TRÊN CHART PHẢI
+    vol_24h_m = vol_24h_usdt / 1_000_000
+    vol_badge_color = '#26a69a' if vol_24h_usdt >= 20_000_000 else '#ef5350'
+    ax_right_candle.text(0.02, 0.93, f"Vol 24h: {vol_24h_m:.1f}M USDT", transform=ax_right_candle.transAxes,
+                         color='white', fontsize=8.5, fontweight='bold',
+                         bbox=dict(facecolor='#1c2030', edgecolor=vol_badge_color, alpha=0.85, boxstyle='round,pad=0.3'))
+
     # Tính toán hiển thị số thứ tự cho chuẩn xác
     info_idx = f"[{current_index + 1}/{len(list_signals)}]" if list_signals and symbol in list_signals else "[CUSTOM COIN]"
     fig.suptitle(f"Multi-Timeframe ({tf_left.upper()} | {tf_right.upper()}): {symbol}  {info_idx}", 
@@ -360,21 +443,33 @@ def render_charts(fig, axes, symbol, limit_bars, custom_style):
 
 def on_key_press(event, fig, axes, limit_bars, custom_style):
     global current_index, list_signals, current_tf_mode, crosshairs, is_updating, ani, bm_background, ruler_elements, current_custom_symbol
+    global favorite_signals, current_view_mode, backup_all_signals
+    global index_all, index_fav  # 🎯 Khai báo 2 biến lưu index độc lập
+
     if is_updating:
         return
 
     changed = False
     target_symbol = None
 
-    # 1. XỬ LÝ PHÍM ĐIỀU HƯỚNG TRÁI / PHẢI / SPACEBAR (Quay về list gốc)
+    # 1. XỬ LÝ PHÍM ĐIỀU HƯỚNG TRÁI / PHẢI / SPACEBAR
     if event.key in ['right', 'left', ' ']:
         if list_signals:
             current_custom_symbol = None # Xóa trạng thái coin ngoài list
             
-            if event.key == 'right' or event.key == ' ': 
-                current_index = (current_index + 1) % len(list_signals)
-            elif event.key == 'left': 
-                current_index = (current_index - 1) % len(list_signals)
+            # Tùy thuộc vào chế độ view hiện tại để tăng/giảm index tương ứng
+            if current_view_mode == "ALL":
+                if event.key == 'right' or event.key == ' ': 
+                    index_all = (index_all + 1) % len(list_signals)
+                elif event.key == 'left': 
+                    index_all = (index_all - 1) % len(list_signals)
+                current_index = index_all
+            else:  # Chế độ "FAV"
+                if event.key == 'right' or event.key == ' ': 
+                    index_fav = (index_fav + 1) % len(list_signals)
+                elif event.key == 'left': 
+                    index_fav = (index_fav - 1) % len(list_signals)
+                current_index = index_fav
                 
             target_symbol = list_signals[current_index]
             changed = True
@@ -391,14 +486,27 @@ def on_key_press(event, fig, axes, limit_bars, custom_style):
         if current_tf_mode != old_tf:
             if current_custom_symbol:
                 target_symbol = current_custom_symbol
-            elif list_signals and current_index < len(list_signals):
-                target_symbol = list_signals[current_index]
+            elif list_signals:
+                # Đảm bảo lấy đúng index của mode hiện tại
+                current_index = index_all if current_view_mode == "ALL" else index_fav
+                if current_index < len(list_signals):
+                    target_symbol = list_signals[current_index]
                 
             if target_symbol:
                 changed = True
 
     # 3. NHẤN PHÍM 'n' ĐỂ NHẬP MÃ COIN TÙY CHỈNH MỚI
     elif event.key.lower() == 'n':
+        # 🎯 THỦ THUẬT: Ép Windows tự động bật và focus vào cửa sổ Console
+        try:
+            # Lấy handle của cửa sổ Console hiện tại
+            hwnd_console = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd_console:
+                # Bật cửa sổ lên trước mặt và kích hoạt focus
+                ctypes.windll.user32.ShowWindow(hwnd_console, 9) # 9 = SW_RESTORE (hiển thị lại nếu đang ẩn/thu nhỏ)
+                ctypes.windll.user32.SetForegroundWindow(hwnd_console)
+        except Exception:
+            pass # Phòng trường hợp chạy trên môi trường không phải Windows trực tiếp
         print("\n" + "="*40)
         user_coin = input("👉 Nhập mã coin muốn xem (VD: SOL, BTC, ETH...): ").strip().upper()
         print("="*40)
@@ -409,25 +517,128 @@ def on_key_press(event, fig, axes, limit_bars, custom_style):
             
             target_symbol = user_coin
             if list_signals and user_coin in list_signals:
-                current_index = list_signals.index(user_coin)
+                # Nếu mã nhập tay trùng với list hiện tại, cập nhật index cho mode đó luôn
+                if current_view_mode == "ALL":
+                    index_all = list_signals.index(user_coin)
+                    current_index = index_all
+                else:
+                    index_fav = list_signals.index(user_coin)
+                    current_index = index_fav
                 current_custom_symbol = None  
             else:
                 current_custom_symbol = user_coin 
             changed = True
+        # 🎯 Bước 2: Sau khi nhấn Enter xong, ép Windows trả focus lại cho cửa sổ Chart
+        try:
+            # Lấy handle của cửa sổ chứa đồ thị Matplotlib hiện tại thông qua tiêu đề window
+            fig = event.canvas.figure
+            title = fig.canvas.manager.get_window_title()
+            hwnd_chart = ctypes.windll.user32.FindWindowW(None, title)
+            
+            if hwnd_chart:
+                ctypes.windll.user32.ShowWindow(hwnd_chart, 9) # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd_chart)
+        except Exception:
+            pass
+    # 🎯 PHÍM 'a': THÊM / XÓA COIN KHỎI DANH SÁCH FAVORITE
+    elif event.key.lower() == 'a':
+        # Xác định mã coin dựa trên index của mode hiện tại
+        current_idx_now = index_all if current_view_mode == "ALL" else index_fav
+        current_coin = current_custom_symbol if current_custom_symbol else (list_signals[current_idx_now] if list_signals else None)
+        
+        if current_coin:
+            if current_coin not in favorite_signals:
+                favorite_signals.append(current_coin)
+                print(f"[*] Đã THÊM {current_coin} vào danh sách Yêu thích! (Tổng số: {len(favorite_signals)})")
+                changed = True # Kích hoạt để vẽ lại nhãn [* FAVED] lên chart ngay lập tức
+                target_symbol = current_coin
+            else:
+                favorite_signals.remove(current_coin)
+                print(f"[*] Đã XÓA {current_coin} khỏi danh sách Yêu thích. (Tổng số: {len(favorite_signals)})")
+                
+                if current_view_mode == "FAV":
+                    list_signals = list(favorite_signals) 
+                    if index_fav >= len(list_signals):
+                        index_fav = max(0, len(list_signals) - 1)
+                    current_index = index_fav
+                    
+                    if list_signals:
+                        target_symbol = list_signals[current_index]
+                        changed = True
+                    else:
+                        print("📭 Danh sách Favorite hiện đang trống! Tự động quay về danh sách Quét gốc.")
+                        current_view_mode = "ALL"
+                        list_signals = list(backup_all_signals)
+                        current_index = index_all
+                        if list_signals: 
+                            target_symbol = list_signals[current_index]
+                            changed = True
+                else:
+                    # Nếu ở mode ALL mà hủy fav, vẫn vẽ lại chart để xóa chữ [* FAVED] đi
+                    target_symbol = current_coin
+                    changed = True
 
-    # Thực thi render lại đồ thị nếu có thay đổi
+    # 🎯 PHÍM 'v': CHUYỂN ĐỔI QUA LẠI GIỮA DANH SÁCH QUÉT (ALL) VÀ YÊU THÍCH (FAV)
+    elif event.key.lower() == 'v':
+        if current_view_mode == "ALL":
+            if not favorite_signals:
+                print("⚠️ Danh sách Yêu thích (Favorite) đang trống! Bấm 'a' để thêm coin trước.")
+                return
+            
+            backup_all_signals = list(list_signals) 
+            list_signals = list(favorite_signals)   
+            current_view_mode = "FAV"
+            
+            if index_fav >= len(list_signals):
+                index_fav = 0
+            current_index = index_fav
+                
+            print(f"🔄 CHUYỂN SANG CHẾ ĐỘ: DANH SÁCH YÊU THÍCH (⭐ {len(list_signals)} mã)")
+            
+            # 🎯 KHÔNG gọi render trực tiếp nữa, đẩy xuống cuối hàm xử lý dọn dẹp trục
+            target_symbol = list_signals[current_index]
+            changed = True
+            
+        elif current_view_mode == "FAV":
+            list_signals = list(backup_all_signals) 
+            current_view_mode = "ALL"
+            
+            if index_all >= len(list_signals):
+                index_all = 0
+            current_index = index_all
+                
+            print(f"🔄 CHUYỂN SANG CHẾ ĐỘ: TOÀN BỘ DANH SÁCH QUÉT (🔍 {len(list_signals)} mã)")
+            
+            if list_signals: 
+                # 🎯 Đẩy xuống cuối hàm xử lý
+                target_symbol = list_signals[current_index]
+                changed = True
+
+    # =========================================================================
+    # 🎯 KHỐI TRUNG TÂM: THỰC THI RE-RENDER VÀ LÀM SẠCH TRỤC TOÀN CỤC
+    # =========================================================================
     if changed and target_symbol:
         try:
             is_updating = True
+            # Tạm dừng luồng cập nhật nến thời gian thực để tránh xung đột dữ liệu
             if ani and ani.event_source: ani.event_source.stop()
+            
+            # Xóa các thành phần đồ họa động (Thước đo, tâm chữ thập)
             crosshairs.clear()
             ruler_elements.clear()
             bm_background = None
-            for ax in axes.flatten(): ax.clear()
             
+            # 🔥 LỆNH QUAN TRỌNG: Đập đi xây lại - Giải phóng hoàn toàn các trục cũ 
+            # Giúp Matplotlib tính lại Autoscale giá cho Coin mới, không bao giờ bị co chart
+            for ax in axes.flatten(): 
+                ax.clear()
+            
+            # Gọi hàm vẽ biểu đồ mới với đầy đủ bộ tham số
             render_charts(fig, axes, target_symbol, limit_bars, custom_style)
+            
         finally:
             is_updating = False
+            # Bật lại luồng chạy tự động cập nhật nến
             if ani and ani.event_source: ani.event_source.start()
 
 def run_animation_update(fig, axes, limit_bars, custom_style):
@@ -480,7 +691,9 @@ def open_interactive_chart_system(detected_coins, initial_index=0, limit_bars=20
     print("  -> Nhấn phím MŨI TÊN PHẢI (→) hoặc SPACEBAR để NEXT coin.")
     print("  -> Nhấn phím MŨI TÊN TRÁI (←) để BACK coin.")
     print("  -> Nhấn phím SỐ 1 để xem [ H4 | H1 ] | Nhấn phím SỐ 2 để xem [ H1 | M5 ].")
-    print("  -> Nhấn phím SỐ 'n' để nhập nhanh một mã coin ngoài danh sách.")
+    print("  -> Nhấn phím 'n' để nhập nhanh một mã coin ngoài danh sách.")
+    print("  -> Nhấn phím 'a' để THÊM / XÓA coin hiện tại vào danh sách Yêu thích.")
+    print("  -> Nhấn phím 'v' để CHUYỂN ĐỔI qua lại giữa danh sách Quét (ALL) và Yêu thích (FAV).")
     print("  📌 Chế độ TỰ ĐỘNG CẬP NHẬT nến mới đang chạy chu kỳ 15 giây/lần.\n")
     
     plt.tight_layout()
